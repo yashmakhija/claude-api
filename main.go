@@ -114,9 +114,10 @@ func main() {
 	http.HandleFunc("/health", healthHandler) // health is public
 	http.HandleFunc("/chat", requireAuth(chatHandler))
 	http.HandleFunc("/stream", requireAuth(streamHandler))
+	http.HandleFunc("/messages", requireAuth(messagesHandler)) // Transparent proxy for tool use
 
 	log.Printf("🚀 Claude API running on port %s", port)
-	log.Printf("📡 Endpoints: /chat (POST), /stream (POST), /health (GET)")
+	log.Printf("📡 Endpoints: /chat, /stream, /messages (POST), /health (GET)")
 	log.Printf("🔐 API Key required: X-API-Key header")
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
@@ -314,6 +315,54 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "data: {\"error\": \"%s\"}\n\n", err.Error())
 		flusher.Flush()
 	}
+}
+
+// messagesHandler - transparent proxy to Anthropic Messages API (for tool use)
+func messagesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Read the entire request body as-is
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Create request to Anthropic
+	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewBuffer(body))
+	if err != nil {
+		http.Error(w, "Failed to create request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/json")
+	setAuthHeaders(req)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	// Forward to Anthropic
+	client := &http.Client{Timeout: 300 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "Anthropic API error: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, "Failed to read response: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Return response as-is with same status code
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(respBody)
 }
 
 // Claude Code version for stealth mode
