@@ -194,6 +194,7 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		if apiKey != clientAPIKey {
+			log.Printf("❌ AUTH FAILED: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			json.NewEncoder(w).Encode(map[string]string{
@@ -201,6 +202,9 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			})
 			return
 		}
+
+		// Log successful request
+		log.Printf("📥 %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
 
 		next(w, r)
 	}
@@ -324,11 +328,28 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	start := time.Now()
+
 	// Read the entire request body as-is
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Failed to read request body: "+err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	// Parse request to log model and tool count
+	var reqData map[string]interface{}
+	if err := json.Unmarshal(body, &reqData); err == nil {
+		model := reqData["model"]
+		toolCount := 0
+		if tools, ok := reqData["tools"].([]interface{}); ok {
+			toolCount = len(tools)
+		}
+		msgCount := 0
+		if msgs, ok := reqData["messages"].([]interface{}); ok {
+			msgCount = len(msgs)
+		}
+		log.Printf("   → model=%v tools=%d messages=%d", model, toolCount, msgCount)
 	}
 
 	// Create request to Anthropic
@@ -347,6 +368,7 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 	client := &http.Client{Timeout: 300 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
+		log.Printf("   ✗ Anthropic error: %v", err)
 		http.Error(w, "Anthropic API error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -357,6 +379,31 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "Failed to read response: "+err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Log response info
+	latency := time.Since(start).Milliseconds()
+	var respData map[string]interface{}
+	if err := json.Unmarshal(respBody, &respData); err == nil {
+		stopReason := respData["stop_reason"]
+		// Count tool_use blocks in response
+		toolUseCount := 0
+		if content, ok := respData["content"].([]interface{}); ok {
+			for _, block := range content {
+				if b, ok := block.(map[string]interface{}); ok {
+					if b["type"] == "tool_use" {
+						toolUseCount++
+						if name, ok := b["name"].(string); ok {
+							log.Printf("   🔧 tool_use: %s", name)
+						}
+					}
+				}
+			}
+		}
+		if usage, ok := respData["usage"].(map[string]interface{}); ok {
+			log.Printf("   ✓ %dms | stop=%v | tools_called=%d | in=%v out=%v",
+				latency, stopReason, toolUseCount, usage["input_tokens"], usage["output_tokens"])
+		}
 	}
 
 	// Return response as-is with same status code
