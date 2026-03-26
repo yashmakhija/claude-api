@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude API Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/.openclaw/workspace/claude-api
+EnvironmentFile=/root/.openclaw/workspace/claude-api/.env
+ExecStart=/root/.openclaw/workspace/claude-api/claude-api
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

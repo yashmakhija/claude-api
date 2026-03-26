@@ -9,7 +9,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,6 +21,14 @@ var (
 	port            string
 	defaultModel    = "claude-sonnet-4-20250514"
 	clientAPIKey    = "" // Set via CLIENT_API_KEY env var
+)
+
+// Metrics
+var (
+	startTime     = time.Now()
+	requestCount  uint64
+	errorCount    uint64
+	version       = "1.1.0"
 )
 
 // Request/Response types
@@ -195,6 +205,7 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 
 		if apiKey != clientAPIKey {
 			log.Printf("❌ AUTH FAILED: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+			atomic.AddUint64(&errorCount, 1)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			json.NewEncoder(w).Encode(map[string]string{
@@ -202,6 +213,9 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			})
 			return
 		}
+
+		// Count successful requests
+		atomic.AddUint64(&requestCount, 1)
 
 		// Log successful request
 		log.Printf("📥 %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
@@ -211,9 +225,23 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{
-		"status": "ok",
-		"model":  defaultModel,
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+
+	uptime := time.Since(startTime)
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "ok",
+		"version":   version,
+		"model":     defaultModel,
+		"uptime":    uptime.String(),
+		"uptime_seconds": int64(uptime.Seconds()),
+		"requests":  atomic.LoadUint64(&requestCount),
+		"errors":    atomic.LoadUint64(&errorCount),
+		"memory_mb": mem.Alloc / 1024 / 1024,
+		"go_version": runtime.Version(),
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
