@@ -125,9 +125,13 @@ func main() {
 	http.HandleFunc("/chat", requireAuth(chatHandler))
 	http.HandleFunc("/stream", requireAuth(streamHandler))
 	http.HandleFunc("/messages", requireAuth(messagesHandler)) // Transparent proxy for tool use
+	
+	// OpenAI-compatible endpoints
+	http.HandleFunc("/v1/models", modelsHandler) // public
+	http.HandleFunc("/v1/chat/completions", requireAuth(openaiChatHandler))
 
 	log.Printf("🚀 Claude API running on port %s", port)
-	log.Printf("📡 Endpoints: /chat, /stream, /messages (POST), /health (GET)")
+	log.Printf("📡 Endpoints: /chat, /stream, /messages, /v1/chat/completions (POST), /health, /v1/models (GET)")
 	log.Printf("🔐 API Key required: X-API-Key header")
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
@@ -459,11 +463,24 @@ func setAuthHeaders(req *http.Request) {
 	}
 }
 
+// For OAuth tokens, prepend Claude Code identity (required by Anthropic)
+func getSystemPrompt(userSystem string) string {
+	if strings.HasPrefix(anthropicAPIKey, "sk-ant-oat") {
+		// OAuth tokens MUST include Claude Code identity
+		identity := "You are Claude Code, Anthropic's official CLI for Claude."
+		if userSystem != "" {
+			return identity + "\n\n" + userSystem
+		}
+		return identity
+	}
+	return userSystem
+}
+
 func callAnthropic(model, system string, messages []Message, maxTokens int, stream bool) (*AnthropicResponse, error) {
 	reqBody := AnthropicRequest{
 		Model:     model,
 		MaxTokens: maxTokens,
-		System:    system,
+		System:    getSystemPrompt(system),
 		Messages:  messages,
 		Stream:    stream,
 	}
@@ -506,7 +523,7 @@ func streamAnthropic(w http.ResponseWriter, flusher http.Flusher, model, system 
 	reqBody := AnthropicRequest{
 		Model:     model,
 		MaxTokens: maxTokens,
-		System:    system,
+		System:    getSystemPrompt(system),
 		Messages:  messages,
 		Stream:    true,
 	}
@@ -563,6 +580,240 @@ func streamAnthropic(w http.ResponseWriter, flusher http.Flusher, model, system 
 			}
 		case "message_stop":
 			fmt.Fprintf(w, "data: {\"done\": true}\n\n")
+			flusher.Flush()
+		}
+	}
+
+	return scanner.Err()
+}
+
+// OpenAI-compatible types
+type OpenAIChatRequest struct {
+	Model    string          `json:"model"`
+	Messages []OpenAIMessage `json:"messages"`
+	Stream   bool            `json:"stream,omitempty"`
+}
+
+type OpenAIMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type OpenAIChatResponse struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	Model   string `json:"model"`
+	Choices []struct {
+		Index   int `json:"index"`
+		Message struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
+}
+
+// /v1/models - list available models
+func modelsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	response := map[string]interface{}{
+		"object": "list",
+		"data": []map[string]interface{}{
+			{"id": "claude-opus-4-20250514", "object": "model", "owned_by": "anthropic"},
+			{"id": "claude-sonnet-4-20250514", "object": "model", "owned_by": "anthropic"},
+			{"id": "claude-3-haiku-20240307", "object": "model", "owned_by": "anthropic"},
+		},
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
+// /v1/chat/completions - OpenAI-compatible chat endpoint
+func openaiChatHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req OpenAIChatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	model := req.Model
+	if model == "" {
+		model = defaultModel
+	}
+
+	// Convert OpenAI messages to our format
+	messages := make([]Message, len(req.Messages))
+	for i, m := range req.Messages {
+		messages[i] = Message{Role: m.Role, Content: m.Content}
+	}
+
+	log.Printf("📥 POST /v1/chat/completions from %s", r.RemoteAddr)
+
+	if req.Stream {
+		// Streaming response
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+			return
+		}
+
+		// Use streamAnthropic but convert to OpenAI SSE format
+		err := streamOpenAI(w, flusher, model, "", messages, 4096)
+		if err != nil {
+			log.Printf("Stream error: %v", err)
+		}
+	} else {
+		// Non-streaming response
+		start := time.Now()
+		response, err := callAnthropic(model, "", messages, 4096, false)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		text := ""
+		if len(response.Content) > 0 {
+			text = response.Content[0].Text
+		}
+
+		openaiResp := OpenAIChatResponse{
+			ID:      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
+			Object:  "chat.completion",
+			Created: time.Now().Unix(),
+			Model:   model,
+		}
+		openaiResp.Choices = []struct {
+			Index   int `json:"index"`
+			Message struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		}{
+			{
+				Index:        0,
+				Message:      struct {Role string `json:"role"`; Content string `json:"content"`}{Role: "assistant", Content: text},
+				FinishReason: "stop",
+			},
+		}
+		openaiResp.Usage.PromptTokens = response.Usage.InputTokens
+		openaiResp.Usage.CompletionTokens = response.Usage.OutputTokens
+		openaiResp.Usage.TotalTokens = response.Usage.InputTokens + response.Usage.OutputTokens
+
+		log.Printf("✅ Response in %dms", time.Since(start).Milliseconds())
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openaiResp)
+	}
+}
+
+// Stream in OpenAI SSE format
+func streamOpenAI(w http.ResponseWriter, flusher http.Flusher, model, system string, messages []Message, maxTokens int) error {
+	reqBody := AnthropicRequest{
+		Model:     model,
+		MaxTokens: maxTokens,
+		System:    getSystemPrompt(system),
+		Messages:  messages,
+		Stream:    true,
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	setAuthHeaders(req)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	client := &http.Client{Timeout: 300 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	chatID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	scanner := bufio.NewScanner(resp.Body)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "" {
+			continue
+		}
+
+		var event StreamEvent
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+
+		switch event.Type {
+		case "content_block_delta":
+			if event.Delta.Text != "" {
+				chunk := map[string]interface{}{
+					"id":      chatID,
+					"object":  "chat.completion.chunk",
+					"created": time.Now().Unix(),
+					"model":   model,
+					"choices": []map[string]interface{}{
+						{
+							"index":         0,
+							"delta":         map[string]string{"content": event.Delta.Text},
+							"finish_reason": nil,
+						},
+					},
+				}
+				data, _ := json.Marshal(chunk)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			}
+		case "message_stop":
+			chunk := map[string]interface{}{
+				"id":      chatID,
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   model,
+				"choices": []map[string]interface{}{
+					{
+						"index":         0,
+						"delta":         map[string]interface{}{},
+						"finish_reason": "stop",
+					},
+				},
+			}
+			data, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
 		}
 	}
