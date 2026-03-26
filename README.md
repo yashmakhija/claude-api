@@ -1,47 +1,49 @@
-# Claude API
+# Claude API Proxy
 
-A lightweight Go wrapper for the Anthropic Claude API with streaming support.
+Personal Claude API endpoint at `claude.iyash.me`.
 
-## Features
+## Current Setup (v2)
 
-- Simple REST API for Claude
-- Streaming (SSE) support
-- API key authentication
-- Conversation history support
-- Configurable models
+Uses [claude-max-api-proxy](https://www.npmjs.com/package/claude-max-api-proxy) to expose Claude Max subscription as an OpenAI-compatible API.
 
-## Endpoints
+### Available Models
 
-| Endpoint | Method | Auth | Description |
-|----------|--------|------|-------------|
-| `/health` | GET | No | Health check |
-| `/chat` | POST | Yes | Regular chat response |
-| `/stream` | POST | Yes | Streaming SSE response |
+- `claude-opus-4` - Most capable
+- `claude-sonnet-4` - Balanced
+- `claude-haiku-4` - Fast
 
-## Usage
+### Usage
 
 ```bash
-# Build
-go build -o claude-api main.go
-
-# Run
-export ANTHROPIC_API_KEY="your-key"
-export CLIENT_API_KEY="your-client-key"  # optional, defaults to env
-./claude-api
-```
-
-## API Example
-
-```bash
-curl -X POST http://localhost:8080/chat \
+curl https://claude.iyash.me/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: your-client-key" \
-  -d '{"message": "Hello!"}'
+  -d '{
+    "model": "claude-opus-4",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
 ```
 
-## Environment Variables
+### Service
 
-- `ANTHROPIC_API_KEY` - Anthropic API key
-- `CLIENT_API_KEY` - API key for clients to access this server
-- `PORT` - Server port (default: 8080)
-- `DEFAULT_MODEL` - Default Claude model (default: claude-sonnet-4-20250514)
+```bash
+# Status
+systemctl status claude-max-proxy
+
+# Logs
+journalctl -u claude-max-proxy -f
+
+# Restart
+systemctl restart claude-max-proxy
+```
+
+### Requirements
+
+- Claude CLI authenticated (`claude auth status`)
+- Node.js 22+
+- nginx with SSL (Let's Encrypt)
+
+---
+
+## Legacy (v1 - Archived)
+
+The `main.go` file is the old Go implementation that used OAuth tokens directly. It was limited to Haiku only. Kept for reference.
